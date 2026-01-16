@@ -210,7 +210,7 @@ cat > /etc/sing-box/config.json <<EOF
       "type": "vless",
       "listen": "0.0.0.0",
       "listen_port": $VLESS_R_PORT,
-      "users": [{ "uuid": "$UUID", "flow": "" }],
+      "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
       "tls": {
         "enabled": true,
         "server_name": "$REALITY_SNI",
@@ -229,7 +229,7 @@ cat > /etc/sing-box/config.json <<EOF
       "type": "vless",
       "listen": "::",
       "listen_port": $VLESS_R6_PORT,
-      "users": [{ "uuid": "$UUID", "flow": "" }],
+      "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
       "tls": {
         "enabled": true,
         "server_name": "$REALITY_SNI",
