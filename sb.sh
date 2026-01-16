@@ -1,0 +1,354 @@
+#!/bin/bash
+# Sing-box 一键部署脚本 (最终双栈版)
+# 支持域名模式 / 自签固定域名 www.epple.com
+# 额外新增：VLESS-REALITY（不影响原有 VLESS-TLS / HY2）
+# Author: Chis (优化 by ChatGPT)
+
+set -e
+
+echo "=================== Sing-box 部署前环境检查 ==================="
+
+# --------- 检查 root ---------
+[[ $EUID -ne 0 ]] && echo "[✖] 请用 root 权限运行" && exit 1 || echo "[✔] Root 权限 OK"
+
+# --------- 检测公网 IP ---------
+SERVER_IPV4=$(curl -4 -s ipv4.icanhazip.com || curl -4 -s ifconfig.me)
+SERVER_IPV6=$(curl -6 -s ipv6.icanhazip.com || curl -6 -s ifconfig.me || true)
+
+[[ -n "$SERVER_IPV4" ]] && echo "[✔] 检测到公网 IPv4: $SERVER_IPV4" || echo "[✖] 未检测到公网 IPv4"
+[[ -n "$SERVER_IPV6" ]] && echo "[✔] 检测到公网 IPv6: $SERVER_IPV6" || echo "[!] 未检测到公网 IPv6（可忽略）"
+
+# --------- 自动安装依赖 ---------
+REQUIRED_CMDS=(curl ss openssl qrencode dig systemctl bash socat cron ufw)
+MISSING_CMDS=()
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    command -v $cmd >/dev/null 2>&1 || MISSING_CMDS+=("$cmd")
+done
+
+if [[ ${#MISSING_CMDS[@]} -gt 0 ]]; then
+    echo "[!] 检测到缺失命令: ${MISSING_CMDS[*]}"
+    echo "[!] 自动安装依赖中..."
+    apt update -y
+    INSTALL_PACKAGES=()
+    for cmd in "${MISSING_CMDS[@]}"; do
+        case "$cmd" in
+            dig) INSTALL_PACKAGES+=("dnsutils") ;;
+            qrencode|socat|ufw) INSTALL_PACKAGES+=("$cmd") ;;
+            *) INSTALL_PACKAGES+=("$cmd") ;;
+        esac
+    done
+    apt install -y "${INSTALL_PACKAGES[@]}"
+fi
+
+# --------- 检查常用端口 ---------
+for port in 80 443; do
+    if ss -tuln | grep -q ":$port"; then
+        echo "[✖] 端口 $port 已被占用"
+    else
+        echo "[✔] 端口 $port 空闲"
+    fi
+done
+
+read -rp "环境检查完成 ✅  确认继续执行部署吗？(y/N): " CONFIRM
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 0
+
+# --------- 模式选择 ---------
+while true; do
+    echo -e "\n请选择部署模式：\n1) 使用域名 + Let's Encrypt 证书\n2) 使用公网 IP + 自签固定域名 www.epple.com"
+    read -rp "请输入选项 (1 或 2): " MODE
+    [[ "$MODE" =~ ^[12]$ ]] && break
+    echo "[!] 输入错误，请重新输入 1 或 2"
+done
+
+# --------- 安装 sing-box ---------
+if ! command -v sing-box &>/dev/null; then
+    echo ">>> 安装 sing-box ..."
+    bash <(curl -fsSL https://sing-box.app/deb-install.sh)
+fi
+
+CERT_DIR="/etc/ssl/sing-box"
+mkdir -p "$CERT_DIR"
+
+# --------- 随机端口函数 ---------
+get_random_port() {
+    while :; do
+        PORT=$((RANDOM%50000+10000))
+        ss -tuln | grep -q ":$PORT" || break
+    done
+    echo $PORT
+}
+
+# --------- 域名模式 ---------
+if [[ "$MODE" == "1" ]]; then
+    while true; do
+        read -rp "请输入你的域名 (例如: example.com): " DOMAIN
+        [[ -z "$DOMAIN" ]] && { echo "[!] 域名不能为空"; continue; }
+
+        DOMAIN_IPV4=$(dig +short A "$DOMAIN" | tail -n1 || true)
+        DOMAIN_IPV6=$(dig +short AAAA "$DOMAIN" | tail -n1 || true)
+
+        echo "[✔] 域名解析检查完成 (IPv4: ${DOMAIN_IPV4:-无}, IPv6: ${DOMAIN_IPV6:-无})"
+        break
+    done
+
+    # 安装 acme.sh
+    if ! command -v acme.sh &>/dev/null; then
+        echo ">>> 安装 acme.sh ..."
+        curl https://get.acme.sh | sh
+        source ~/.bashrc || true
+    fi
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+
+    # --------- 检查是否已有证书 ---------
+    LE_CERT_PATH="$HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer"
+    LE_KEY_PATH="$HOME/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key"
+
+    if [[ -f "$LE_CERT_PATH" && -f "$LE_KEY_PATH" ]]; then
+        echo "[✔] 已检测到现有 Let's Encrypt 证书，直接导入"
+        cp "$LE_CERT_PATH" "$CERT_DIR/fullchain.pem"
+        cp "$LE_KEY_PATH" "$CERT_DIR/privkey.pem"
+        chmod 644 "$CERT_DIR"/*.pem
+    else
+        echo ">>> 申请新的 Let's Encrypt TLS 证书"
+
+        # 自动选择可用 IP 协议
+        if [[ -n "$SERVER_IPV4" ]]; then
+            USE_LISTEN="--listen-v4"
+        elif [[ -n "$SERVER_IPV6" ]]; then
+            USE_LISTEN="--listen-v6"
+        else
+            echo "[✖] 未检测到可用 IPv4 或 IPv6，无法申请证书"
+            exit 1
+        fi
+
+        ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone $USE_LISTEN --keylength ec-256 --force
+        ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" \
+            --ecc \
+            --key-file "$CERT_DIR/privkey.pem" \
+            --fullchain-file "$CERT_DIR/fullchain.pem" \
+            --force
+        chmod 644 "$CERT_DIR"/*.pem
+        echo "[✔] TLS 证书申请完成"
+    fi
+else
+    # --------- 自签固定域名模式 ---------
+    DOMAIN="www.epple.com"
+    echo "[!] 自签模式，将生成固定域名 $DOMAIN 的自签证书 (URI 使用 VPS 公网 IP)"
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$CERT_DIR/privkey.pem" \
+        -out "$CERT_DIR/fullchain.pem" \
+        -subj "/CN=$DOMAIN" \
+        -addext "subjectAltName = DNS:$DOMAIN,IP:$SERVER_IPV4,IP:${SERVER_IPV6:-::1}"
+    chmod 644 "$CERT_DIR"/*.pem
+    echo "[✔] 自签证书生成完成"
+fi
+
+# --------- 输入端口 ---------
+read -rp "请输入 VLESS TCP TLS 端口 (默认 443, 输入0随机): " VLESS_PORT
+[[ -z "$VLESS_PORT" || "$VLESS_PORT" == "0" ]] && VLESS_PORT=$(get_random_port)
+
+# 新增：REALITY 独立端口（不影响原 TLS）
+read -rp "请输入 VLESS REALITY 端口 (默认 0 随机): " VLESS_R_PORT
+[[ -z "$VLESS_R_PORT" || "$VLESS_R_PORT" == "0" ]] && VLESS_R_PORT=$(get_random_port)
+
+read -rp "请输入 Hysteria2 UDP 端口 (默认 8443, 输入0随机): " HY2_PORT
+[[ -z "$HY2_PORT" || "$HY2_PORT" == "0" ]] && HY2_PORT=$(get_random_port)
+
+# IPv6 端口
+VLESS6_PORT=$(get_random_port)
+VLESS_R6_PORT=$(get_random_port)
+HY2_6_PORT=$(get_random_port)
+
+# 自动生成 UUID / Hysteria2 密码
+UUID=$(cat /proc/sys/kernel/random/uuid)
+HY2_PASS=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9')
+
+# --------- REALITY 参数（新增） ---------
+read -rp "REALITY 伪装站点(Handshake server) [默认: www.speedtest.net]: " REALITY_SERVER
+REALITY_SERVER=${REALITY_SERVER:-www.speedtest.net}
+read -rp "REALITY SNI(server_name) [默认同上]: " REALITY_SNI
+REALITY_SNI=${REALITY_SNI:-$REALITY_SERVER}
+
+REALITY_KEYPAIR="$(sing-box generate reality-keypair)"
+REALITY_PRIVATE_KEY="$(echo "$REALITY_KEYPAIR" | awk '/PrivateKey/ {print $2}')"
+REALITY_PUBLIC_KEY="$(echo "$REALITY_KEYPAIR" | awk '/PublicKey/ {print $2}')"
+REALITY_SHORT_ID="$(openssl rand -hex 8)"
+
+# --------- 生成 sing-box 配置 ---------
+cat > /etc/sing-box/config.json <<EOF
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    // -------- VLESS TLS (原有) --------
+    {
+      "type": "vless",
+      "listen": "0.0.0.0",
+      "listen_port": $VLESS_PORT,
+      "users": [{ "uuid": "$UUID" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$DOMAIN",
+        "certificate_path": "$CERT_DIR/fullchain.pem",
+        "key_path": "$CERT_DIR/privkey.pem"
+      }
+    },
+    {
+      "type": "vless",
+      "listen": "::",
+      "listen_port": $VLESS6_PORT,
+      "users": [{ "uuid": "$UUID" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$DOMAIN",
+        "certificate_path": "$CERT_DIR/fullchain.pem",
+        "key_path": "$CERT_DIR/privkey.pem"
+      }
+    },
+
+    // -------- VLESS REALITY (新增) --------
+    {
+      "type": "vless",
+      "listen": "0.0.0.0",
+      "listen_port": $VLESS_R_PORT,
+      "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$REALITY_SNI",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "$REALITY_SERVER",
+            "server_port": 443
+          },
+          "private_key": "$REALITY_PRIVATE_KEY",
+          "short_id": ["$REALITY_SHORT_ID"]
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "listen": "::",
+      "listen_port": $VLESS_R6_PORT,
+      "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$REALITY_SNI",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "$REALITY_SERVER",
+            "server_port": 443
+          },
+          "private_key": "$REALITY_PRIVATE_KEY",
+          "short_id": ["$REALITY_SHORT_ID"]
+        }
+      }
+    },
+
+    // -------- Hysteria2 (原有) --------
+    {
+      "type": "hysteria2",
+      "listen": "0.0.0.0",
+      "listen_port": $HY2_PORT,
+      "users": [{ "password": "$HY2_PASS" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$DOMAIN",
+        "certificate_path": "$CERT_DIR/fullchain.pem",
+        "key_path": "$CERT_DIR/privkey.pem"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "listen": "::",
+      "listen_port": $HY2_6_PORT,
+      "users": [{ "password": "$HY2_PASS" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "$DOMAIN",
+        "certificate_path": "$CERT_DIR/fullchain.pem",
+        "key_path": "$CERT_DIR/privkey.pem"
+      }
+    }
+  ],
+  "outbounds": [{ "type": "direct" }]
+}
+EOF
+
+# 注意：JSON 不支持 // 注释。上面为了可读性加了注释行，如果你想 100% 严格 JSON，
+# 请删掉所有以 // 开头的行。
+# 我这里直接自动删除注释行，避免 sing-box 启动失败：
+sed -i 's@^\s*//.*$@@g' /etc/sing-box/config.json
+
+echo "[✔] sing-box 配置生成完成：IPv4 + IPv6 双栈（含 VLESS-REALITY）"
+
+# --------- 防火墙端口开放 ---------
+if command -v ufw &>/dev/null; then
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw allow "$VLESS_PORT"/tcp
+    ufw allow "$VLESS6_PORT"/tcp
+    ufw allow "$VLESS_R_PORT"/tcp
+    ufw allow "$VLESS_R6_PORT"/tcp
+    ufw allow "$HY2_PORT"/udp
+    ufw allow "$HY2_6_PORT"/udp
+    ufw reload || true
+fi
+
+# --------- 启动 sing-box ---------
+systemctl enable sing-box
+systemctl restart sing-box
+sleep 3
+
+# --------- 检查端口监听并显示信息 ---------
+ss -tulnp | grep ":$VLESS_PORT" >/dev/null 2>&1 && echo "[✔] VLESS TLS IPv4（$VLESS_PORT） 已监听" || echo "[✖] VLESS TLS IPv4（$VLESS_PORT） 未监听"
+ss -tulnp | grep ":$VLESS6_PORT" >/dev/null 2>&1 && echo "[✔] VLESS TLS IPv6（$VLESS6_PORT） 已监听" || echo "[✖] VLESS TLS IPv6（$VLESS6_PORT） 未监听"
+ss -tulnp | grep ":$VLESS_R_PORT" >/dev/null 2>&1 && echo "[✔] VLESS REALITY IPv4（$VLESS_R_PORT） 已监听" || echo "[✖] VLESS REALITY IPv4（$VLESS_R_PORT） 未监听"
+ss -tulnp | grep ":$VLESS_R6_PORT" >/dev/null 2>&1 && echo "[✔] VLESS REALITY IPv6（$VLESS_R6_PORT） 已监听" || echo "[✖] VLESS REALITY IPv6（$VLESS_R6_PORT） 未监听"
+ss -ulnp | grep ":$HY2_PORT" >/dev/null 2>&1 && echo "[✔] Hysteria2 UDP IPv4（$HY2_PORT） 已监听" || echo "[✖] Hysteria2 UDP IPv4（$HY2_PORT） 未监听"
+ss -ulnp | grep ":$HY2_6_PORT" >/dev/null 2>&1 && echo "[✔] Hysteria2 UDP IPv6（$HY2_6_PORT） 已监听" || echo "[✖] Hysteria2 UDP IPv6（$HY2_6_PORT） 未监听"
+
+# --------- 生成节点 URI 和二维码 ---------
+if [[ "$MODE" == "1" ]]; then
+    NODE_HOST="$DOMAIN"
+    INSECURE="0"
+else
+    NODE_HOST="$SERVER_IPV4"
+    INSECURE="1"
+fi
+
+# 原有：VLESS TLS
+VLESS_URI="vless://$UUID@$NODE_HOST:$VLESS_PORT?encryption=none&security=tls&sni=$DOMAIN&type=tcp#VLESS-TLS-$NODE_HOST"
+
+# 新增：VLESS REALITY
+VLESS_REALITY_URI="vless://$UUID@$NODE_HOST:$VLESS_R_PORT?encryption=none&security=reality&sni=$REALITY_SNI&fp=chrome&pbk=$REALITY_PUBLIC_KEY&sid=$REALITY_SHORT_ID&type=tcp&flow=xtls-rprx-vision#VLESS-REALITY-$NODE_HOST"
+
+HY2_URI="hysteria2://$HY2_PASS@$NODE_HOST:$HY2_PORT?insecure=$INSECURE&sni=$DOMAIN#HY2-$NODE_HOST"
+
+echo -e "\n=================== VLESS-TLS 节点 ==================="
+echo "$VLESS_URI"
+command -v qrencode &>/dev/null && echo "$VLESS_URI" | qrencode -t ansiutf8
+
+echo -e "\n=================== VLESS-REALITY 节点 ==================="
+echo "$VLESS_REALITY_URI"
+command -v qrencode &>/dev/null && echo "$VLESS_REALITY_URI" | qrencode -t ansiutf8
+
+echo -e "\n=================== Hysteria2 节点 ==================="
+echo "$HY2_URI"
+command -v qrencode &>/dev/null && echo "$HY2_URI" | qrencode -t ansiutf8
+
+# --------- 生成订阅 JSON ---------
+SUB_FILE="/root/singbox_nodes.json"
+cat > $SUB_FILE <<EOF
+{
+  "vless_tls": "$VLESS_URI",
+  "vless_reality": "$VLESS_REALITY_URI",
+  "hysteria2": "$HY2_URI"
+}
+EOF
+
+echo -e "\n=================== 订阅文件内容 ==================="
+cat $SUB_FILE
+echo -e "\n订阅文件已保存到：$SUB_FILE"
+
+echo -e "\n=================== 部署完成 ==================="
