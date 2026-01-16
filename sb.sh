@@ -340,11 +340,11 @@ command -v qrencode &>/dev/null && echo "$HY2_URI" | qrencode -t ansiutf8
 # --------- 生成订阅 JSON ---------
 SUB_FILE="/root/singbox_nodes.json"
 cat > $SUB_FILE <<EOF
-{
-  "vless_tls": "$VLESS_URI",
-  "vless_reality": "$VLESS_REALITY_URI",
-  "hysteria2": "$HY2_URI"
-}
+
+  $VLESS_URI,
+  $VLESS_REALITY_URI,
+  $HY2_URI
+
 EOF
 
 echo -e "\n=================== 订阅文件内容 ==================="
