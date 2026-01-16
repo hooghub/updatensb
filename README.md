@@ -59,7 +59,7 @@ root 权限
 1️⃣ 一键安装：
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/hooghub/updatensb/main/sb.sh)
-
+```
 2️⃣ 环境检查
 
 脚本会自动检查：
